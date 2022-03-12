@@ -11,7 +11,7 @@
 	<script type="text/javascript" src="script_land.js" defer></script>
 		 <script type="text/javascript" src="16vo3kqdcxw9.js"></script> 
 		
-		/head>
+		</head>
 	<body>
 		<div class="wrapper">
 			<div class="forma">
